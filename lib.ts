@@ -23,6 +23,37 @@ export function keyFor(chatId: number | string, threadId: number | undefined): s
   return `${chatId}:${threadId ?? 'main'}`
 }
 
+/**
+ * Does a bridge answer in a given forum topic?
+ *
+ * Several bridges, on different machines, can share one supergroup — Telegram
+ * allows only one poller per bot token, so they cannot share a bot. Each one
+ * answers in the topics it owns and ignores the rest, which is what stops a
+ * single message drawing a reply from every machine in the group.
+ *
+ * Pure so it can be tested without a bridge: everything it needs is passed in.
+ */
+export function ownsTopic(o: {
+  multiServer: boolean
+  chatId: number | string
+  threadId: number | undefined
+  homeThreadId?: number
+  pinned: Set<string>
+  owned: Record<string, true>
+}): boolean {
+  // Single-server: there is no one else to defer to.
+  if (!o.multiServer) return true
+  // The forum's own built-in General is shared by every bot in the group, so by
+  // default no machine claims it — otherwise the first one deployed would swallow
+  // the one thread everybody else also sees. A single-bridge deployment that
+  // wants it anyway opts in explicitly with `main` in TG_ALLOWED_TOPICS, which is
+  // the same key keyFor() gives it. Drop that entry when a second machine joins.
+  if (o.threadId === undefined) return o.pinned.has('main')
+  if (o.homeThreadId !== undefined && o.homeThreadId === o.threadId) return true
+  if (o.pinned.has(String(o.threadId))) return true
+  return o.owned[keyFor(o.chatId, o.threadId)] === true
+}
+
 // A short, filesystem-safe tag for one topic, used to give it its own inbox and
 // outbox inside a directory it SHARES with another topic (a fork). Derived from the
 // topic key's last segment — the thread id, or `main` — because that is already the

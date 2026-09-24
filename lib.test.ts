@@ -8,7 +8,7 @@
  */
 import { test, expect, describe } from 'bun:test'
 import {
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, ownsTopic,
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
@@ -1501,5 +1501,55 @@ describe('fan-out: the proposal reads cleanly', () => {
     const out = renderFanoutProposal(parseFanoutPlan('FANOUT 1 | read | T | the brief'), { cap: 3 })
     expect(out).toContain('\nthe brief')
     expect(out).not.toContain('\n   the brief')
+  })
+})
+
+describe('multi-server: which topics a bridge answers in', () => {
+  const CHAT = -100777
+  const base = { chatId: CHAT, pinned: new Set<string>(), owned: {} as Record<string, true> }
+
+  test('single-server answers everywhere, including the forum General', () => {
+    expect(ownsTopic({ ...base, multiServer: false, threadId: 42 })).toBe(true)
+    expect(ownsTopic({ ...base, multiServer: false, threadId: undefined })).toBe(true)
+  })
+
+  test('multi-server ignores a topic it was never given', () => {
+    expect(ownsTopic({ ...base, multiServer: true, threadId: 42 })).toBe(false)
+  })
+
+  test("the forum's own General belongs to nobody by default", () => {
+    // Shared by every bot in the group. If one machine took it, the first one
+    // deployed would swallow the thread everyone else also sees.
+    expect(ownsTopic({ ...base, multiServer: true, threadId: undefined, homeThreadId: 7 })).toBe(false)
+  })
+
+  test("a lone bridge can opt in to the forum General with 'main'", () => {
+    // The escape hatch for a one-machine deployment that still wants the plain
+    // group thread answered. Removing the entry is what makes room for a second.
+    expect(ownsTopic({ ...base, multiServer: true, threadId: undefined, pinned: new Set(['main']) })).toBe(true)
+  })
+
+  test('a machine always owns its own General-<name> topic', () => {
+    expect(ownsTopic({ ...base, multiServer: true, threadId: 7, homeThreadId: 7 })).toBe(true)
+  })
+
+  test('TG_ALLOWED_TOPICS pins ownership without a claim', () => {
+    expect(ownsTopic({ ...base, multiServer: true, threadId: 42, pinned: new Set(['42']) })).toBe(true)
+  })
+
+  test('a claimed topic is owned, and only in its own chat', () => {
+    const owned = { [keyFor(CHAT, 42)]: true as const }
+    expect(ownsTopic({ ...base, multiServer: true, threadId: 42, owned })).toBe(true)
+    // Same thread number in a different group is a different topic entirely.
+    expect(ownsTopic({ ...base, multiServer: true, chatId: -100888, threadId: 42, owned })).toBe(false)
+  })
+
+  test('two machines in one group never both answer', () => {
+    const a = { multiServer: true, chatId: CHAT, homeThreadId: 7, pinned: new Set<string>(), owned: { [keyFor(CHAT, 42)]: true as const } }
+    const b = { multiServer: true, chatId: CHAT, homeThreadId: 9, pinned: new Set<string>(), owned: { [keyFor(CHAT, 55)]: true as const } }
+    for (const t of [7, 9, 42, 55, 1234, undefined]) {
+      const both = [ownsTopic({ ...a, threadId: t }), ownsTopic({ ...b, threadId: t })].filter(Boolean).length
+      expect(both).toBeLessThanOrEqual(1)
+    }
   })
 })
