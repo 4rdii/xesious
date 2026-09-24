@@ -89,6 +89,7 @@ off is now a **hard startup error**, not a warning.
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
+| `/claim` `/release` | Multi-server only: take over this topic on this machine, or hand it back. See [Multiple servers, one group](#multiple-servers-one-group). |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
@@ -213,6 +214,49 @@ All keys live in `.env` (see [.env.example](.env.example)). Highlights:
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
+
+## Multiple servers, one group
+
+Telegram allows exactly one `getUpdates` poller per bot token, so several
+machines cannot share a bot — the bridge refuses to start as a second poller for
+this reason. What they *can* share is one supergroup.
+
+Give each machine its own bot from BotFather and its own `TG_SERVER_NAME`, point
+them all at the same `TG_ALLOWED_CHATS`, and each bridge answers only in the
+topics it owns. Every other message in the group it ignores in silence, so one
+post does not draw a reply from every machine you run.
+
+```
+# on the Frankfurt box
+TELEGRAM_BOT_TOKEN=<its own token>
+TG_SERVER_NAME=frankfurt
+TG_ALLOWED_CHATS=-1001234567890
+
+# on the Helsinki box — same group, different bot and name
+TELEGRAM_BOT_TOKEN=<a second token>
+TG_SERVER_NAME=helsinki
+TG_ALLOWED_CHATS=-1001234567890
+```
+
+On first run each bridge creates **`General-<name>`** and introduces itself
+there. That topic is where you talk to that machine, and it can never be
+released.
+
+| | |
+|---|---|
+| `/claim` | this machine takes over the current topic |
+| `/release` | hands it back; nothing answers there until someone claims it |
+
+Topics the bridge creates itself — `/fork`, `/import`, fan-out children — are
+claimed automatically, so a conversation started on one machine stays on it.
+
+The forum's own built-in General (the topic-less thread) is shared by every bot
+in the group, so by default nobody claims it and nobody answers there. A
+single-machine deployment that still wants it can opt in with
+`TG_ALLOWED_TOPICS=main`, and drop that entry when a second machine joins.
+
+Leave `TG_SERVER_NAME` unset for a single-server install and nothing above
+applies: the bridge answers in every topic, exactly as before.
 
 ## Permission modes
 
