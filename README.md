@@ -244,7 +244,7 @@ released.
 
 | | |
 |---|---|
-| `/claim` | this machine takes over the current topic |
+| `/claim <name>` | the machine called `<name>` takes over the current topic. The name is required: a bare `/claim` reaches every bridge in the group, so all of them would claim it at once |
 | `/release` | hands it back; nothing answers there until someone claims it |
 
 Topics the bridge creates itself — `/fork`, `/import`, fan-out children — are
