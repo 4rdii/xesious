@@ -215,8 +215,9 @@ async function ensureHomeTopic(chatId: string): Promise<void> {
     saveState()
     await bot.api.sendMessage(Number(chatId),
       `${homeTopicName()} is up. This topic is ${SERVER_NAME}'s home: talk to that machine here.\n\n` +
-      `Other topics are claimed one at a time — run /claim inside a topic and ${SERVER_NAME} takes it over, ` +
-      `/release to hand it back. Topics created from here (/fork) are claimed automatically.`,
+      `Other topics are claimed one at a time — run /claim ${SERVER_NAME} inside a topic and this machine takes it over, ` +
+      `/release to hand it back. The name is required: a bare /claim would be taken by every machine in this group at once. ` +
+      `Topics created from here (/fork) are claimed automatically.`,
       { message_thread_id: t.message_thread_id })
   } catch (e) {
     console.error(`[warn] could not create ${homeTopicName()} in ${chatId}: ${e}`)
@@ -3600,8 +3601,16 @@ bot.on('message', async ctx => {
   // here would mean N-1 "not mine" replies to every message in the group, which
   // is exactly the noise the ownership model exists to prevent. /claim is the
   // one exception, since that is how an unowned topic gets an owner at all.
-  const isClaim = (msg.text || '').trim().split(/\s+/)[0]?.split('@')[0] === '/claim'
-  if (ctx.chat.type !== 'private' && !ownsTopic(chatId, threadId) && !isClaim) return
+  // /claim is the one command allowed through in a topic nobody owns, since it
+  // is how an unowned topic gets an owner at all. In multi-server mode it must
+  // NAME the machine: a bare /claim passed this gate on every bridge in the
+  // group, so all of them claimed the same topic and answered together — which
+  // is the exact collision the ownership model exists to prevent.
+  const words = (msg.text || '').trim().split(/\s+/)
+  const isClaimCmd = words[0]?.split('@')[0] === '/claim'
+  const claimsUs = isClaimCmd && (!MULTI_SERVER ||
+    (words[1] || '').toLowerCase() === SERVER_NAME.toLowerCase())
+  if (ctx.chat.type !== 'private' && !ownsTopic(chatId, threadId) && !claimsUs) return
 
   // File uploads: save into this topic's inbox. A caption (if any) runs as a prompt.
   // Voice note (or round video) → transcribe → run as a prompt, when the topic is
@@ -3697,7 +3706,7 @@ bot.on('message', async ctx => {
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
       `/sessions <dir…> — list the sessions stored for one or more directories\n` +
       `/fork [name] — continue this conversation in a second topic, from here (same directory)\n` +
-      (MULTI_SERVER ? `\nThis machine is ${SERVER_NAME}. /claim takes this topic over here, /release hands it back.\n` : '') +
+      (MULTI_SERVER ? `\nThis machine is ${SERVER_NAME}. /claim ${SERVER_NAME} takes this topic over here, /release hands it back.\n` : '') +
       `/import <dir…> — make a topic for each session there (bound + backfilled)\n` +
       `/history [N] — re-post the last N turns of this topic's session`)
     return
@@ -3717,6 +3726,17 @@ bot.on('message', async ctx => {
     if (threadId === undefined) { await send(ctx, threadId, "The forum's own General is shared by every machine in this group, so no bot claims it. Use a topic."); return }
     if (homeTopics[String(chatId)] === threadId) { await send(ctx, threadId, `This is ${SERVER_NAME}'s home topic — it cannot be released.`); return }
     if (cmd === '/claim') {
+      // Same rule as the gate above, repeated here because a topic this bridge
+      // ALREADY owns reaches the command without passing that check.
+      const target = (text.trim().split(/\s+/)[1] || '')
+      if (MULTI_SERVER && target.toLowerCase() !== SERVER_NAME.toLowerCase()) {
+        if (ownsTopic(chatId, threadId)) {
+          await send(ctx, threadId, target
+            ? `This topic belongs to ${SERVER_NAME}. To move it, /release here first, then /claim ${target} from the other machine.`
+            : `Name the machine: /claim ${SERVER_NAME}. A bare /claim would be taken by every bridge in this group at once.`)
+        }
+        return
+      }
       claimTopic(chatId, threadId)
       await send(ctx, threadId, `📌 Claimed by ${SERVER_NAME}. Messages here run on that machine.`)
     } else {
