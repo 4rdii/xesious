@@ -19,6 +19,23 @@ import { join, relative } from 'node:path'
 const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
 const STATE_FILE = join(TMP, 'state.json')
 process.env.TELEGRAM_BOT_TOKEN = '123:test-token'
+// Single-server, always — pinned rather than merely left unset. Bun loads the
+// project's own .env for `bun test`, so on a DEPLOYED box this inherited the real
+// TG_SERVER_NAME, MULTI_SERVER came out true, and the ownership gate dropped every
+// group message before its first log line: 108 of the 340 cases here failed on a
+// machine whose code was fine. A suite must describe its own world, not the world
+// of whichever box happens to run it. The multi-server gate itself is covered
+// deliberately, by the cases at the end of this file.
+process.env.TG_SERVER_NAME = ''
+process.env.TG_ALLOWED_TOPICS = ''
+// Same reasoning, same class of leak. Each is pinned to the value it already had
+// when no .env was present, so nothing about these runs changes — but a deployed
+// box can no longer hand the suite its own config. TG_WORKDIR is the one that
+// mattered most: unpinned, `DEFAULT_WORKDIR` fell back to the real topic
+// directory of whatever machine ran the tests.
+process.env.TG_WORKDIR = process.cwd()
+process.env.TG_PERMISSION_MODE = 'auto'
+process.env.TG_ALLOWED_TOOLS = ''
 // 1 is the admin in every test group; 3 is an allowed member who is not an admin,
 // for the /config permission cases.
 process.env.TG_ALLOWED_USERS = '1,3'
@@ -261,6 +278,23 @@ const finalReply = (cs: Call[]): string | undefined => {
   const s = sends(cs)
   return s.length ? s[s.length - 1].payload.text : undefined
 }
+
+// Runs first, and says plainly what went wrong, because the failure it guards
+// against is otherwise unreadable: a stray TG_SERVER_NAME turns multi-server mode
+// on for the whole file, the ownership gate then drops every group message before
+// it is logged, and a hundred unrelated cases fail at once on a machine whose code
+// is fine. One clear failure here is worth more than that pile.
+describe('the suite describes its own world', () => {
+  test('multi-server is off, whatever the box running this has in its .env', () => {
+    expect(process.env.TG_SERVER_NAME ?? '').toBe('')
+    expect(process.env.TG_ALLOWED_TOPICS ?? '').toBe('')
+  })
+  test('the deployed box cannot hand this suite its own workdir or permissions', () => {
+    expect(process.env.TG_WORKDIR).toBe(process.cwd())
+    expect(process.env.TG_PERMISSION_MODE).toBe('auto')
+    expect(process.env.TG_ALLOWED_TOOLS ?? '').toBe('')
+  })
+})
 
 describe('a normal turn', () => {
   test('posts a status message, edits in tool steps, deletes it, and delivers the reply', async () => {
