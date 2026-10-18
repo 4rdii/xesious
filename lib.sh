@@ -32,9 +32,18 @@ find_bun() {
 # owns_pid <pid> <dir> — is this exact pid mine AND running in <dir>?
 # Both halves must succeed positively. An unreadable owner or cwd returns false:
 # "I could not prove this is mine" is never the same as "it is mine".
+#
+# Hardening for root deployments (this fork runs as root, unlike the
+# environment these checks were authored against): when we ARE root, the
+# owner check below stops discriminating (pid 1 is root-owned too) and
+# /proc/1/cwd is readable to us, so the original two checks alone report pid 1
+# as provably ours. test/shell/run.sh asserts it must not, and that case fails
+# as root without these two lines.
 owns_pid() {
   local pid="${1:-}" dir="${2:-}" owner cwd
   [ -n "$pid" ] && [ -n "$dir" ] || return 1
+  [ "$pid" != "1" ] || return 1
+  [ "$dir" != "/" ] || return 1
   owner=$(stat -c %u "/proc/$pid" 2>/dev/null) || return 1
   [ -n "$owner" ] && [ "$owner" = "$(id -u)" ] || return 1
   cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || return 1
