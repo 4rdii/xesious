@@ -74,7 +74,12 @@ say "typechecking…"
 # never checks a type. tsc is the actual typecheck. (Neither catches a reference to
 # a `const` declared later in the same scope from inside an async callback; that is
 # a runtime TDZ error, and only a test that exercises the path will find it.)
-bun build bridge.ts --target=node >/dev/null 2>"$LOGS/build.err" || {
+# --outdir, not stdout: since the MTProto path arrived, mtcute brings two .wasm
+# assets along, so the bundle is three files and bun refuses to write multiple
+# outputs to stdout ("cannot write multiple output files without an output
+# directory"). Only whether it builds matters here, so the output goes into the
+# run's own log dir and is discarded with it.
+bun build bridge.ts --target=node --outdir "$LOGS/build" >/dev/null 2>"$LOGS/build.err" || {
   fail "bridge.ts does not compile — NOT restarting. Nothing changed. (log: $LOGS/build.err)"; cat "$LOGS/build.err" >&2; exit 1; }
 if [ -x node_modules/.bin/tsc ]; then
   node_modules/.bin/tsc --noEmit >"$LOGS/tsc.err" 2>&1 || {
