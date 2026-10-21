@@ -18,6 +18,16 @@ import { join, relative } from 'node:path'
 // --- Env must be set BEFORE bridge.ts is imported (it reads config at module load).
 const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
 const STATE_FILE = join(TMP, 'state.json')
+// Whatever is running this suite is itself often Claude Code, and its own
+// CLAUDE_CODE_* variables reach the child through childEnv()'s `{ ...process.env }`,
+// which strips only TELEGRAM_* and TG_*. CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD
+// is the one that bites: set whenever the parent session has additionalDirectories,
+// it made "a plain DM gets no group memory" report group memory the bridge never
+// granted. Scrubbed as a class rather than one name at a time — that was the lesson
+// of the TG_SERVER_NAME leak below, and naming them individually is how the next one
+// gets through. The suite sets back the few it genuinely needs.
+for (const k of Object.keys(process.env)) if (k.startsWith('CLAUDE_CODE_')) delete process.env[k]
+
 process.env.TELEGRAM_BOT_TOKEN = '123:test-token'
 // Single-server, always — pinned rather than merely left unset. Bun loads the
 // project's own .env for `bun test`, so on a DEPLOYED box this inherited the real
@@ -57,6 +67,9 @@ process.env.XESIOUS_STUB_QUERY_LOG = QUERY_LOG
 // While this file exists the query writer takes a second and a half.
 const SLOW_QUERY = join(TMP, 'slow-query')
 process.env.XESIOUS_STUB_QUERY_SLOW = SLOW_QUERY
+// While this file exists the next turn comes back empty (and removes it).
+const EMPTY_ONCE = join(TMP, 'empty-once')
+process.env.XESIOUS_STUB_EMPTY_ONCE = EMPTY_ONCE
 process.env.TG_AUTO_QUIET_MS = '300'
 // Each message runs at once, as before bursts; the burst cases turn it on (_setBurst).
 process.env.TG_BURST_QUIET_MS = '0'
@@ -95,6 +108,9 @@ process.env.TG_TASKS_WEBHOOK_PORT = String(HOOK_PORT)
 process.env.TG_PEER_BOTS = '@PostingBot'
 // …and a bot of another kind, asked best effort.
 process.env.TG_OTHER_BOTS = 'WeatherBot'
+// The cloud Bot API's file caps, whatever the .env Bun loads says: past them is
+// MTProto (mtproto.ts), which only the staging tier can reach.
+process.env.TG_API_ID = process.env.TG_API_HASH = ''
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -141,6 +157,8 @@ let nextMessageId = 1000
 // because the fallback to merely closing is the interesting half — a fallback that
 // no test ever reaches is a fallback nobody knows is broken.
 let denyDelete = false
+// createForumTopic refused, as for a bot that may not manage topics.
+let denyCreateTopic = false
 // A media group is all-or-nothing, so the fallback to two individual sends is the
 // half that keeps a failure cosmetic instead of losing the answer. A fallback no
 // test ever reaches is a fallback nobody knows is broken.
@@ -216,6 +234,9 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   }
   if (method === 'deleteForumTopic' && denyDelete) {
     return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete messages' }
+  }
+  if (method === 'createForumTopic' && denyCreateTopic) {
+    return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to create a topic' }
   }
   if (method === 'createForumTopic') {
     // The real API returns a thread id, and the fan-out code depends on it: without
@@ -353,6 +374,14 @@ describe('degenerate CLI outputs', () => {
     // have edited files, and repeating that unasked is worse than the lost answer.
     expect(String(btn.callback_data)).toStartWith('retry:')
   })
+  test('an answer followed by a silent notification turn is delivered, not reported as none', async () => {
+    // Found in production: a run waiting on background subagents answered, then a
+    // last task notification started a turn that said nothing. Its empty result
+    // stood for the whole run, and the answer only survived in the run record.
+    const cs = await incoming(1010, 'NOTIFIED')
+    expect(finalReply(cs)).toContain('answeredBeforeNotice')
+    expect(sends(cs).some(c => String(c.payload.text ?? '').includes('No answer came back'))).toBe(false)
+  })
   test('is_error result is still delivered (the error text)', async () => {
     const cs = await incoming(1004, 'ERROR')
     expect(finalReply(cs)).toContain('boom')
@@ -432,6 +461,53 @@ describe('session lifecycle: /new and /resume', () => {
     expect(finalReply(r)).toMatch(/Restored session/i)
     const cont = await incoming(1021, 'continue')
     expect(finalReply(cont)).toContain('hadResume')           // resuming again
+  })
+
+  test('/new <request>: the fresh session\'s first message is the request', async () => {
+    await incoming(1023, 'bind a session')
+    const cs = await incoming(1023, '/new what changed since then')
+    const said = cs.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text))
+    expect(said[0]).toMatch(/Fresh session started/)          // the old one is kept, as with a bare /new
+    expect(finalReply(cs)).toContain('noResume')              // the request ran, in the fresh session
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toMatch(/\nwhat changed since then$/)
+    expect(stateNow().sessions['1023:main'].prevSessionId).toBe('sessTESTAAA')
+  })
+
+  // A file with "/new …" as its caption: fresh, then the file and the rest of the caption.
+  async function fileWithCaption(chatId: number, caption: string): Promise<Call[]> {
+    const before = calls.length
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const m = String(input?.url ?? input).match(/^https:\/\/api\.telegram\.org\/file\/bot[^/]+\/documents\/(.+)$/)
+      const f = m && [...fakeFiles.values()].find(x => x.name === decodeURIComponent(m[1]))
+      return f ? new Response(new Uint8Array(f.data)) : realFetch(input, init)
+    }) as any
+    fakeFiles.set(`notes-${chatId}`, { name: 'notes.txt', data: Buffer.from('some notes') })
+    try {
+      await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+        message_id: updateId + 5000, date: 0, chat: { id: chatId, type: 'private', first_name: 'T' }, from: { id: 1, is_bot: false, first_name: 'T' },
+        document: { file_id: `notes-${chatId}`, file_unique_id: `n${chatId}`, file_name: 'notes.txt', file_size: 10 }, caption } })
+      await bridge._drainQueue(`${chatId}:main`)
+    } finally { globalThis.fetch = realFetch; fakeFiles.clear() }
+    return calls.slice(before)
+  }
+
+  test('a file captioned "/new <request>": a fresh session, and the request runs on the file', async () => {
+    await incoming(1024, 'bind a session')
+    const cs = await fileWithCaption(1024, '/new summarize these notes')
+    expect(cs.find(c => c.method === 'sendMessage')?.payload.text).toMatch(/Fresh session started/)
+    expect(finalReply(cs)).toContain('noResume')
+    const prompt = readFileSync(LAST_PROMPT, 'utf8')
+    expect(prompt).toContain('summarize these notes')
+    expect(prompt).not.toMatch(/\/new/)                        // the command is not part of what Claude reads
+  })
+
+  test('a file captioned only "/new": a fresh session, and the file is just saved', async () => {
+    await incoming(1025, 'bind a session')
+    const cs = await fileWithCaption(1025, '/new')
+    expect(cs.find(c => c.method === 'sendMessage')?.payload.text).toMatch(/Fresh session started/)
+    expect(stateNow().sessions['1025:main'].sessionId).toBeUndefined()   // no turn ran on it
+    expect(JSON.stringify(cs)).toContain('notes.txt')                     // …but it was saved and acknowledged
   })
 })
 
@@ -3468,6 +3544,34 @@ describe('conversation mode', () => {
     expect(p).toMatch(/whole recorded conversation of this topic \(3 messages\) is in \.\/inbox\/conversation\.md/)
   })
 
+  test('a retried "no answer" keeps the conversation and the asker, whoever taps it', async () => {
+    // Found in production: the request was the message a bare "@bot" replied to.
+    // The retry kept only the words of the mention, so the model was handed an
+    // empty message — from whoever tapped — and asked what was wanted.
+    setMode(`${C}:809`, 'conversation')
+    const target = (await say(809, 'please check why these three payments bounced')).id
+    writeFileSync(EMPTY_ONCE, '')
+    const { cs } = await say(809, '@testbot', ADA,
+      { reply_to_message: { message_id: target, date: 0, chat: { id: C, type: 'supergroup' }, from: SARA, text: 'please check why these three payments bounced' } })
+    const warn = sends(cs).find(c => String(c.payload.text ?? '').includes('No answer came back'))
+    expect(warn).toBeTruthy()
+    // The button is posted as retry:pending and then given the warning's own id.
+    const armed = cs.find(c => c.method === 'editMessageReplyMarkup' && String(c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data ?? '').startsWith('retry:'))
+    const data = String(armed!.payload.reply_markup.inline_keyboard[0][0].callback_data)
+    const warnId = Number(data.slice(6))
+    expect(warnId).toBeGreaterThan(0)
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'rt1', chat_instance: 'x', data,
+      from: person(3, 'Bea'),
+      message: { message_id: warnId, date: 0, chat: { id: C, type: 'supergroup', is_forum: true }, message_thread_id: 809, is_topic_message: true } } })
+    await bridge._drainQueue(`${C}:809`)
+    expect(replied(calls.slice(before))).toBe(true)
+    const p = handed()
+    expect(p).toContain('please check why these three payments bounced')
+    expect(p).toMatch(/message from Ada, id 1:/)
+    expect(p).not.toMatch(/message from Bea/)
+  })
+
   test('in a topic the BOT created, ordinary messages are not replies to the bot', async () => {
     // Telegram hands every message in a topic its creation as reply_to_message; when
     // the bot made the topic, that message is from the bot. It is not a reply.
@@ -5576,6 +5680,40 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
       await settleCards()
       expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
     } finally { delete bridge._groupSettings()[String(G)].activityTopic }
+  })
+
+  test('a group whose first task could not make the activity topic gets it once the bot may manage topics', async () => {
+    const G = -100555
+    denyCreateTopic = true
+    try {
+      make({ name: 'Early bird', prompt: 'E', cron: '7 5 * * *' }, scopeOf(G, 611))
+      await settleCards()
+    } finally { denyCreateTopic = false }
+    expect(T().store.getMeta(`activity:${G}`)).toBe('none')
+    // Told once; a later task does not try again.
+    const before = calls.length
+    make({ name: 'Second', prompt: 'S', cron: '7 6 * * *' }, scopeOf(G, 612))
+    await settleCards()
+    expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
+    // Promoted without that right: still nothing.
+    const promote = (can_manage_topics: boolean) => bridge.bot.handleUpdate({ update_id: updateId++, my_chat_member: {
+      chat: { id: G, type: 'supergroup', title: 'Ops', is_forum: true }, from: ADA, date: 0,
+      old_chat_member: { status: 'member', user: { id: 42, is_bot: true, first_name: 'TestBot' } },
+      new_chat_member: { status: 'administrator', user: { id: 42, is_bot: true, first_name: 'TestBot' }, can_manage_topics,
+        can_be_edited: false, is_anonymous: false, can_manage_chat: true, can_delete_messages: true, can_manage_video_chats: false,
+        can_restrict_members: false, can_promote_members: false, can_change_info: true, can_invite_users: true,
+        can_post_stories: false, can_edit_stories: false, can_delete_stories: false } } } as any)
+    const before2 = calls.length
+    await promote(false)
+    await settleCards()
+    expect(calls.slice(before2).some(c => c.method === 'createForumTopic')).toBe(false)
+    expect(T().store.getMeta(`activity:${G}`)).toBe('none')
+    // With it, the topic is made at once, without waiting for another task.
+    const before3 = calls.length
+    await promote(true)
+    await settleCards()
+    expect(calls.slice(before3).some(c => c.method === 'createForumTopic' && c.payload.chat_id === G && c.payload.name === '🗂 Tasks')).toBe(true)
+    expect(Number(T().store.getMeta(`activity:${G}`))).toBeGreaterThan(0)
   })
 
   test("a task set up in a forum's General is logged too; a group without topics has no activity topic", async () => {

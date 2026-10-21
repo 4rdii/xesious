@@ -870,6 +870,140 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
+async def feature_big_file_over_mtproto(client, bot):
+    """A file over the cloud Bot API's 20 MB cap still lands in the inbox, whole.
+
+    getFile refuses anything over 20 MB ("file is too big"). With TG_API_ID and
+    TG_API_HASH set, the bridge fetches such a file over MTProto by its message
+    instead (mtproto.ts). 25 MB of random bytes, sent with no caption, must arrive in
+    this DM's inbox byte for byte, and no "couldn't save" may come back.
+    """
+    import hashlib
+    name = "a 25 MB upload is fetched over MTProto"
+    if not (os.environ.get("TG_API_ID") and os.environ.get("TG_API_HASH")):
+        return (name, False, "TG_API_ID/TG_API_HASH are not set, so the MTProto path was never exercised")
+    inbox = os.path.join(topic_cwd() or "", "inbox")
+    data = os.urandom(25 * 1024 * 1024)
+    want = hashlib.sha256(data).hexdigest()
+    up = os.path.join(os.environ.get("TG_SESSIONS_BASE") or "/tmp", "big-probe.bin")
+    os.makedirs(os.path.dirname(up), exist_ok=True)
+    with open(up, "wb") as fh:
+        fh.write(data)
+    seen = []
+
+    @client.on(events.NewMessage(chats=bot))
+    @client.on(events.MessageEdited(chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    def landed():
+        if not os.path.isdir(inbox):
+            return None
+        for f in os.listdir(inbox):
+            p = os.path.join(inbox, f)
+            if f.startswith("big-probe") and os.path.getsize(p) == len(data):
+                with open(p, "rb") as fh:
+                    return p if hashlib.sha256(fh.read()).hexdigest() == want else None
+        return None
+
+    print("  → sending 25 MB with no caption")
+    await client.send_file(bot, up, force_document=True)
+    got = await _until(landed, 300)
+    client.remove_event_handler(handler)
+    os.remove(up)
+    refused = next((reply_text(m) for m in seen if "couldn't save" in (reply_text(m) or "")), None)
+    print(f"    inbox: {got or 'nothing whole in ' + inbox}")
+    problems = []
+    if refused:
+        problems.append(f"the bridge refused it: {refused[:200]!r}")
+    if not got:
+        problems.append("no byte-identical copy reached the DM's inbox")
+    if any((reply_text(m) or "").startswith("⬇️ Downloading") for m in seen):
+        problems.append("a progress bar was shown for a download of a few seconds")
+    return (name, not problems, "; ".join(problems) if problems else "25 MB arrived whole over MTProto, with no bar for a quick one")
+
+
+async def _progress_problems(client, chat, seen, head):
+    """A slow transfer's status message: posted with a bar, and gone once it ended."""
+    status = next((m for m in seen if (reply_text(m) or "").startswith(head)), None)
+    if not status:
+        return [f"no {head!r} status message was posted"]
+    frames = [reply_text(m).splitlines()[1] for m in seen if m.id == status.id]
+    print(f"    status frames: {frames}")
+    if "▱" not in reply_text(status) and "▰" not in reply_text(status):
+        return [f"the status had no bar: {reply_text(status)!r}"]
+    await asyncio.sleep(3)
+    if await client.get_messages(chat, ids=status.id):
+        return ["the status message was left behind after the transfer"]
+    return []
+
+
+async def feature_big_upload_over_mtproto(client, bot):
+    """A file over the cloud Bot API's 50 MB upload cap is still sent, whole.
+
+    sendDocument refuses anything over 50 MB. With TG_API_ID and TG_API_HASH set,
+    the bridge sends it over MTProto instead (mtproto.ts). /get of a 60 MB file in
+    this DM's directory must deliver it byte for byte, quickly enough to show no
+    progress bar; /get of a 200 MB one takes long enough to get a bar, which must be
+    removed when it is done.
+    """
+    import hashlib
+    name = "a 60 MB file is sent over MTProto"
+    if not (os.environ.get("TG_API_ID") and os.environ.get("TG_API_HASH")):
+        return (name, False, "TG_API_ID/TG_API_HASH are not set, so the MTProto path was never exercised")
+    cwd = topic_cwd()
+    os.makedirs(cwd, exist_ok=True)
+    data = os.urandom(60 * 1024 * 1024)
+    with open(os.path.join(cwd, "big-out.bin"), "wb") as fh:
+        fh.write(data)
+    seen = []
+
+    @client.on(events.NewMessage(chats=bot))
+    @client.on(events.MessageEdited(chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    print("  → /get big-out.bin (60 MB)")
+    await client.send_message(bot, "/get big-out.bin")
+    doc = await _until(lambda: next((m for m in seen if m.file and m.file.name == "big-out.bin"), None), 300)
+    await asyncio.sleep(1)
+    client.remove_event_handler(handler)
+    problems = []
+    if not doc:
+        said = [(reply_text(m) or "")[:160] for m in seen if not m.file]
+        problems.append("no big-out.bin came back" + (f"; the bot said {said}" if said else ""))
+    else:
+        body = await client.download_media(doc, file=bytes)
+        print(f"    received {len(body) / 1048576:.0f} MB")
+        if hashlib.sha256(body).digest() != hashlib.sha256(data).digest():
+            problems.append(f"the file that came back differs ({len(body)} bytes, sent {len(data)})")
+        if any((reply_text(m) or "").startswith("⬆️ Uploading") for m in seen):
+            problems.append("a progress bar was shown for an upload of a few seconds")
+    os.remove(os.path.join(cwd, "big-out.bin"))
+
+    # Slow enough for a bar: 200 MB is ~27 s at the ~7.5 MB/s these bots get.
+    with open(os.path.join(cwd, "big-slow.bin"), "wb") as fh:
+        for _ in range(200):
+            fh.write(os.urandom(1024 * 1024))
+    seen.clear()
+    client.add_event_handler(handler, events.NewMessage(chats=bot))
+    client.add_event_handler(handler, events.MessageEdited(chats=bot))
+    print("  → /get big-slow.bin (200 MB)")
+    await client.send_message(bot, "/get big-slow.bin")
+    slow = await _until(lambda: next((m for m in seen if m.file and m.file.name == "big-slow.bin"), None), 400)
+    await asyncio.sleep(1)
+    client.remove_event_handler(handler)
+    if not slow:
+        problems.append("no big-slow.bin came back")
+    elif slow.file.size != 200 * 1024 * 1024:
+        problems.append(f"big-slow.bin came back as {slow.file.size} bytes")
+    else:
+        problems += await _progress_problems(client, bot, seen, "⬆️ Uploading big-slow.bin")
+    os.remove(os.path.join(cwd, "big-slow.bin"))
+    return (name, not problems, "; ".join(problems) if problems else
+            "60 MB came back whole with no bar; 200 MB came back with a bar that was then removed")
+
+
 async def feature_files_in_and_out(client, bot):
     """A NORMAL topic — not a fork, not a fan-out parent: files in, files out.
 
@@ -3531,7 +3665,8 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  # Straight after it: the promoted run only exists once run_alongside
                  # passes, and stealing the binding is what it does next.
                  feature_promoted_run_keeps_the_topics_session,
-                 feature_files_in_and_out, feature_fork_carries_the_conversation,
+                 feature_files_in_and_out, feature_big_file_over_mtproto, feature_big_upload_over_mtproto,
+                 feature_fork_carries_the_conversation,
                  # After the other DM cases: it rebinds this DM's session to a past one
                  # and puts it back afterwards, so anything running between the two would
                  # be talking to the wrong conversation.

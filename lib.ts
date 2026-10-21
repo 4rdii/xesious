@@ -169,6 +169,40 @@ export function getPathArg(text: string, home: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// big file transfers
+// ---------------------------------------------------------------------------
+
+// Whether a transfer is slow enough to be worth a status message: one that looks
+// like taking more than 20 s in all, judged from its speed once it has run for 2 s.
+// A file that is done in a few seconds would only flash a bar and take it away.
+export function transferWorthShowing(done: number, total: number, ms: number): boolean {
+  if (ms < 2000 || done <= 0) return false
+  return total / (done / ms) > 20_000
+}
+
+// A big file on its way, as its status message shows it while it moves:
+//   ⬇️ Downloading report.zip
+//   ▰▰▰▰▰▱▱▱▱▱▱▱ 42%
+//   131 / 312 MB · 7.1 MB/s · ~26 s left
+// Speed and time left appear once there is a second of history to go on.
+export function transferText(t: { up: boolean; name: string; done: number; total: number; ms: number }): string {
+  const WIDTH = 12
+  const frac = t.total > 0 ? Math.min(1, Math.max(0, t.done / t.total)) : 0
+  const filled = Math.round(frac * WIDTH)
+  const mb = (n: number) => (n / 1048576).toFixed(n < 10 * 1048576 ? 1 : 0)
+  const head = `${t.up ? '⬆️ Uploading' : '⬇️ Downloading'} ${t.name}`
+  const bar = `${'▰'.repeat(filled)}${'▱'.repeat(WIDTH - filled)} ${Math.floor(frac * 100)}%`
+  let line = `${mb(t.done)} / ${mb(t.total)} MB`
+  const rate = t.ms >= 1000 ? t.done / (t.ms / 1000) : 0
+  if (rate > 0) {
+    const left = Math.ceil((t.total - t.done) / rate)
+    line += ` · ${(rate / 1048576).toFixed(1)} MB/s`
+    if (left > 0) line += ` · ~${left < 90 ? `${left} s` : `${Math.round(left / 60)} min`} left`
+  }
+  return `${head}\n${bar}\n${line}`
+}
+
+// ---------------------------------------------------------------------------
 // permission modes
 // ---------------------------------------------------------------------------
 
@@ -1365,6 +1399,14 @@ export function isNonAnswer(text: string): boolean {
   const t = (text ?? '').trim()
   if (!t) return true                       // an empty turn is a non-answer too
   return NON_ANSWERS.includes(t.toLowerCase())
+}
+
+// The last thing a run actually said, for when its final result is a non-answer:
+// a run's later turns (one per background-task notification) can end in silence
+// after an earlier one answered.
+export function lastAnswerBlock(blocks: string[]): string | undefined {
+  for (let i = blocks.length - 1; i >= 0; i--) if (!isNonAnswer(blocks[i])) return blocks[i]
+  return undefined
 }
 
 // ---------------------------------------------------------------------------

@@ -28,11 +28,11 @@ import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 
 import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import {
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
   ownsTopic as libOwnsTopic,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
-  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
+  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, lastAnswerBlock, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
   speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, speechEstimateSeconds, type SpeechUnit, type UnitTiming,
@@ -65,6 +65,7 @@ import { TaskStore } from './tasks/store'
 import { TaskRuntime, activityOf, type ClaudeOutcome, type FilterVerdict, type PostKind, type PostOpts, type StepCall } from './tasks/runtime'
 import { FILTER_SYSTEM, filterUser, parseFilterAnswer } from './tasks/filters'
 import { runCommand, runScript, type ScriptOutcome } from './tasks/scripts'
+import { bigFiles, MTPROTO_MAX } from './mtproto'
 import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
@@ -320,6 +321,12 @@ const LOCAL_API = Boolean(API_ROOT)
 const LOCAL_API_DATA = resolve(process.env.TG_LOCAL_API_DATA || join(HERE, 'state', 'bot-api'))
 const TG_DOWNLOAD_LIMIT = LOCAL_API ? Infinity : 20 * 1024 * 1024      // cloud getFile cap
 const TG_UPLOAD_LIMIT = (LOCAL_API ? 2000 : 50) * 1024 * 1024          // sendDocument cap
+// The lighter way past the download cap: with an api_id/api_hash (my.telegram.org)
+// a file over 20 MB is fetched over MTProto instead, up to 2 GB, while everything
+// else stays on the cloud Bot API (mtproto.ts). A local server needs neither.
+const API_ID = Number(process.env.TG_API_ID || 0), API_HASH = (process.env.TG_API_HASH || '').trim()
+const BIG_FILES = !LOCAL_API && API_ID && API_HASH
+  ? bigFiles({ apiId: API_ID, apiHash: API_HASH, token: TOKEN, stateDir: dirname(STATE_FILE) }) : null
 
 // The bot's own avatar. On startup, if the bot has no profile photo, set this one.
 // (setMyProfilePhoto is a real Bot API method — BotFather is not required.)
@@ -1628,9 +1635,18 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // A turn that produced no answer is a failed turn, not a reply. Both the
         // empty result and the CLI queue layer's "No response requested." land
         // here; delivering either verbatim is what made questions look ignored.
-        const noAnswer = !isError && isNonAnswer(finalText)
+        //
+        // But only when the run said nothing at all. A run that waits on background
+        // work goes on after it has answered: each task notification starts a turn
+        // with a result of its own, and the last one may say nothing. That empty
+        // result used to stand for the whole run, so a written answer was reported
+        // as none and kept only in the run record. Found in production.
+        const lastSaid = !isError && isNonAnswer(finalText) ? lastAnswerBlock(textBlocks) : undefined
+        if (lastSaid) console.log(`[claude] ${key}: the last result was ${JSON.stringify(finalText.slice(0, 60))}; delivering the last thing it said`)
+        const text = lastSaid ?? finalText
+        const noAnswer = !isError && isNonAnswer(text)
         if (noAnswer) console.error(`[warn] no answer for ${key}: ${JSON.stringify(finalText.slice(0, 60))}`)
-        void finish({ text: finalText || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
+        void finish({ text: text || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
       }
       else if (stalled) void finish({
         text: `⚠️ The run stalled — nothing came back for ${Math.round(IDLE_TIMEOUT_MS / 60000)} minutes, so I stopped it. Nothing was delivered. Try again, or send /stop if it happens repeatedly.`,
@@ -2386,6 +2402,7 @@ async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | '
   const g = (groupSettings[String(m.chatId)] ??= {})
   if (value === undefined) delete g[d.id]; else g[d.id] = value
   noteGroupChange(m, d.id)
+  if (d.id === 'activityTopic') retryActivityTopic(String(m.chatId))
   let cleared = 0
   const kept = overrideCount(m.chatId, d.id)
   if (scope === 'e') {
@@ -3351,7 +3368,7 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
     const done = convFetched.get(r.file.id)
     if (done && existsSync(done)) { saved.set(r.id, `./${relative(cwd, done)}`); continue }
     try {
-      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size }, cwd, key)
+      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size, chat: chatId, msgId: r.id }, cwd, key, threadId)
       convFetched.set(r.file.id, abs)
       saved.set(r.id, `./${relative(cwd, abs)}`)
       fetched++
@@ -3813,9 +3830,14 @@ function uniquePath(dir: string, name: string): string {
   for (let i = 1; ; i++) { const p = join(dir, `${stem}-${i}${ext}`); if (!existsSync(p)) return p }
 }
 
-// The downloadable attachment on a message, if any (largest size for photos).
-type Attachment = { fileId: string; name: string; size: number }
+// The downloadable attachment on a message, if any (largest size for photos). It
+// keeps the message it came on: a file over 20 MB is fetched by that, not its id.
+type Attachment = { fileId: string; name: string; size: number; chat?: number; msgId?: number }
 function pickAttachment(msg: any): Attachment | null {
+  const att = pickFile(msg)
+  return att && { ...att, chat: msg.chat?.id, msgId: msg.message_id }
+}
+function pickFile(msg: any): Attachment | null {
   const d = msg.document; if (d) return { fileId: d.file_id, name: d.file_name || 'document', size: d.file_size || 0 }
   if (msg.photo?.length) { const p = msg.photo[msg.photo.length - 1]; return { fileId: p.file_id, name: `photo-${p.file_unique_id}.jpg`, size: p.file_size || 0 } }
   const v = msg.video; if (v) return { fileId: v.file_id, name: v.file_name || `video-${v.file_unique_id}.mp4`, size: v.file_size || 0 }
@@ -3826,13 +3848,63 @@ function pickAttachment(msg: any): Attachment | null {
   return null
 }
 
+// A big file's status message (transferText): posted once the transfer looks like
+// taking over 20 s (transferWorthShowing), edited as it moves, deleted when it ends
+// however it ends. Its speed is timed from the first bytes, not from the start: the
+// first big file after a restart also waits for the MTProto login, which would make
+// a quick one look slow. Edits are at least 3 s apart, as Telegram rate-limits edits
+// per chat; a status that can't be posted is just skipped.
+function transferStatus(chat: number, threadId: number | undefined, replyTo: number | undefined, up: boolean, name: string, total: number) {
+  let t0 = 0, done0 = 0
+  const text = (done: number) => transferText({ up, name, done, total, ms: Date.now() - t0 })
+  let posted: Promise<number | undefined> | undefined
+  let last = 0, shown = ''
+  return {
+    progress(done: number) {
+      if (!t0) { t0 = Date.now(); done0 = done; return }
+      if (!posted) {
+        if (!transferWorthShowing(done - done0, total - done0, Date.now() - t0)) return
+        shown = text(done)
+        last = Date.now()
+        posted = bot.api.sendMessage(chat, shown, { ...destOpts({ threadId, replyTo }), disable_notification: true })
+          .then(m => m.message_id, () => undefined)
+        return
+      }
+      if (Date.now() - last < 3000) return
+      last = Date.now()
+      const s = text(done)
+      if (s !== shown) { shown = s; void posted.then(id => id && bot.api.editMessageText(chat, id, s).catch(() => {})) }
+    },
+    async end() {
+      const id = await posted
+      if (id) await bot.api.deleteMessage(chat, id).catch(() => {})
+    },
+  }
+}
+
 // Download a Telegram file into a topic's inbox. Returns the saved absolute path.
-async function receiveFile(ctx: Context, att: { fileId: string; name: string; size: number }, cwd: string, key: string): Promise<string> {
-  if (att.size && att.size > TG_DOWNLOAD_LIMIT)
+async function receiveFile(ctx: Context, att: Attachment, cwd: string, key: string, threadId: number | undefined): Promise<string> {
+  const destFor = (ext: string) => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext))
+  // Over the cap, or a size Telegram didn't give and getFile refused: over MTProto.
+  const viaMtproto = BIG_FILES && att.chat && att.msgId ? async () => {
+    if (att.size > MTPROTO_MAX) throw new Error(`file is ${fmtBytes(att.size)}, over the ${fmtBytes(MTPROTO_MAX)} a bot can fetch from Telegram.`)
+    const dest = destFor(extname(att.name))
+    const t0 = Date.now()
+    const bar = transferStatus(att.chat!, threadId, att.msgId, false, basename(dest), att.size)
+    try { await BIG_FILES.download(att.chat!, att.msgId!, dest, bar.progress) } finally { await bar.end() }
+    console.log(`[file<-] over MTProto in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+    return dest
+  } : null
+  if (att.size > TG_DOWNLOAD_LIMIT && !viaMtproto)
     throw new Error(
       `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
-      `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
-  const dest = await fetchTelegramFile(ctx.api, att.fileId, ext => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext)))
+      `To fetch files up to 2 GB, set TG_API_ID and TG_API_HASH (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
+  let dest: string
+  if (att.size > TG_DOWNLOAD_LIMIT) dest = await viaMtproto!()
+  else {
+    try { dest = await fetchTelegramFile(ctx.api, att.fileId, destFor) }
+    catch (e) { if (!viaMtproto || !/file is too big/i.test(String(e))) throw e; dest = await viaMtproto() }
+  }
   console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
   return dest
 }
@@ -3860,11 +3932,13 @@ async function fetchTelegramFile(api: Context['api'], fileId: string, destFor: (
 
 // A file that is too big to send, described the way the user needs to hear it.
 // Returns '' when the file is fine.
+// Past the Bot API's 50 MB it goes over MTProto when that is set up (sendFile).
 function tooBig(path: string): string {
   const size = statSync(path).size
-  if (size <= TG_UPLOAD_LIMIT) return ''
-  return `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.` +
-    (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`)
+  const limit = BIG_FILES ? MTPROTO_MAX : TG_UPLOAD_LIMIT
+  if (size <= limit) return ''
+  return `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(limit)} bot upload limit.` +
+    (LOCAL_API || BIG_FILES ? '' : `\nSet TG_API_ID and TG_API_HASH to send files up to 2 GB (see README).`)
 }
 
 // Send one file from disk to the chat/topic. Returns true on success.
@@ -3886,6 +3960,17 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
   if (big) { await send(ctx, threadId, big); return false }
   const size = statSync(path).size
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
+  if (size > TG_UPLOAD_LIMIT && BIG_FILES) {
+    // Over MTProto, the caption as plain text: it takes neither Markdown nor HTML.
+    const plain = caption && (captionMode ? plainCaption ?? stripMd(caption) : caption).slice(0, CAPTION_MAX)
+    const bar = transferStatus(ctx.chat!.id, threadId, replyTo, true, basename(path), size)
+    try {
+      await BIG_FILES.upload(ctx.chat!.id, path, { threadId, replyTo, caption: plain || undefined, onProgress: bar.progress })
+      console.log(`[file->] ${path} (${fmtBytes(size)}, over MTProto)`)
+      return true
+    } catch (e) { await send(ctx, threadId, `⚠️ could not send ${basename(path)}: ${e}`); return false }
+    finally { await bar.end() }
+  }
   const opts: any = destOpts({ threadId, replyTo })
   if (caption) {
     opts.caption = caption.slice(0, 1024)
@@ -3931,7 +4016,15 @@ async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: 
   if (usable.length === 0) return undefined
   const oversized = usable.map(tooBig).filter(Boolean)
   if (oversized.length) { await send(ctx, threadId, oversized.join('\n\n')); return undefined }
-  if (usable.length === 1) { await sendFile(ctx, threadId, usable[0], caption, replyTo, captionMode, plainCaption); return undefined }
+  // A file past the Bot API's 50 MB goes over MTProto, which a group can't mix with.
+  if (usable.length === 1 || usable.some(p => statSync(p).size > TG_UPLOAD_LIMIT)) {
+    let first = true
+    for (const p of usable) {
+      await sendFile(ctx, threadId, p, first ? caption : undefined, replyTo, captionMode, first ? plainCaption : undefined)
+      first = false
+    }
+    return undefined
+  }
 
   const one = (p: string, i: number) => {
     const extra: any = {}
@@ -4980,14 +5073,19 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, key: stri
 // Prompts kept so a "no answer" can be retried with one tap. In memory only and
 // capped: a retry after a restart is not worth persisting state for, and the
 // button says so rather than silently doing nothing.
-const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number; forwarded?: Forwarded }>()
+//
+// The turn is kept whole, not just its words. In a group the request is often in
+// the message the mention replies to, and a bare "@bot" retried without that
+// conversation reached the model as an empty message. Found in production.
+type RetryTurn = Pick<PromptKind, 'conv' | 'forwarded' | 'asker'>
+const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number } & RetryTurn>()
 const RETRY_MAX = 50
 
 // A turn that came back with nothing is reported as such, with the offer to run it
 // again. Deliberately a button rather than an automatic resend: the turn may
 // already have edited files or run commands, and repeating those without being
 // asked is worse than the missing answer.
-async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo?: number, forwarded?: Forwarded): Promise<void> {
+async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo: number | undefined, turn: RetryTurn): Promise<void> {
   const opts: any = destOpts({ threadId, replyTo })
   const msg = await ctx.api.sendMessage(ctx.chat!.id,
     '⚠️ No answer came back for that message. Nothing was lost — tap to send it again.',
@@ -4995,7 +5093,7 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   ).catch(() => null)
   if (!msg) return
   if (retryPrompts.size >= RETRY_MAX) retryPrompts.delete(retryPrompts.keys().next().value as string)
-  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo, ...(forwarded ? { forwarded } : {}) })
+  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo, ...turn })
   await ctx.api.editMessageReplyMarkup(ctx.chat!.id, msg.message_id, {
     reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: `retry:${msg.message_id}` }]] },
   }).catch(() => {})
@@ -5358,6 +5456,9 @@ type PromptKind = {
   // Messages the person forwarded: a forwardedPreamble block, handed over before their
   // own message, and the forwarded words themselves for the status and the search.
   forwarded?: Forwarded
+  // Who asked, when it is not who this update is from: a retry is tapped by anyone,
+  // but the request is still the asker's.
+  asker?: Context['from']
 }
 type Forwarded = { block: string; text: string }
 // A person's message the way the model must see it to act on it: behind the marker
@@ -5369,10 +5470,10 @@ function forwardedOf(ctx: Context, msg: any, text: string): Forwarded | undefine
   if (!from) return undefined
   return { block: forwardedPreamble(BRIDGE_NONCE, userName(ctx.from!), [{ from, date: msg.forward_origin.date, text }]), text }
 }
-const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
+const frameFrom = (ctx: Context, text: string, from = ctx.from) => frameUserMessage(text, {
   nonce: BRIDGE_NONCE,
-  name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
-  id: ctx.from?.id,
+  name: [from?.first_name, from?.last_name].filter(Boolean).join(' ') || from?.username,
+  id: from?.id,
 })
 // Put a turn's status up now, Interrupt and all, as a job with no process yet (see
 // handlePrompt). Undefined when Telegram refuses: the run then posts its own, as it
@@ -5493,7 +5594,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // Landed before the run shows what the recall found, so it can never overwrite it.
   await early?.edit
   const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason)
-    : (kind.forwarded?.block ?? '') + frameFrom(ctx, prompt || (kind.forwarded ? '(nothing of their own: only the forwarded messages above)' : '')))
+    : (kind.forwarded?.block ?? '') + frameFrom(ctx, prompt || (kind.forwarded ? '(nothing of their own: only the forwarded messages above)' : ''), kind.asker ?? ctx.from))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
@@ -5580,7 +5681,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       return
     }
     if (res.noAnswer) {
-      await sendNoAnswer(ctx, threadId, key, prompt, replyLink(), kind.forwarded)
+      await sendNoAnswer(ctx, threadId, key, prompt, replyLink(), { conv: kind.conv, forwarded: kind.forwarded, asker: kind.asker ?? ctx.from })
       return
     }
     if (!background && !res.isError && res.text.trim()) rememberAsked(key, said)
@@ -6590,7 +6691,7 @@ bot.on('message', async ctx => {
     enqueue(vKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, att, cwd, vKey) }
+      try { saved = await receiveFile(ctx, att, cwd, vKey, threadId) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save the voice note: ${e}`); return }
       const heard = await transcribe(saved)
       if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
@@ -6604,7 +6705,10 @@ bot.on('message', async ctx => {
   if (attachment) {
     if (!isAllowed(ctx)) return
     console.log(`[in] chat=${chatId} topic=${threadId ?? '-'} from=${ctx.from.id} file=${attachment.name} (${fmtBytes(attachment.size)})`)
-    await gather(ctx, keyFor(chatId, threadId), threadId, { msg, text: msg.caption?.trim() ?? '', att: attachment })
+    let caption = msg.caption?.trim() ?? ''
+    const fresh = (msg as any).forward_origin ? undefined : freshCaption(caption)
+    if (fresh) { await startFresh(ctx, keyFor(chatId, threadId), threadId); caption = fresh.rest }
+    await gather(ctx, keyFor(chatId, threadId), threadId, { msg, text: caption, att: attachment })
     return
   }
 
@@ -7037,18 +7141,11 @@ bot.on('message', async ctx => {
       .catch(e => console.error(`[error] plan task ${key}: ${e}`))
     return
   }
-  if (cmd === '/new' || cmd === '/reset' || cmd === '/clear') {
-    // In a private continuation, a fresh start is a fresh start of your OWN chat: it
-    // leaves the topic first, and the fresh session is in your own directory.
-    const left = ctx.chat.type === 'private' ? await leavePrivate(key) : undefined
-    // A record even when there is none yet: its stamp is what outranks a live link.
-    const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
-    if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
-    topicSessionChanged(key)
-    const fresh = (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
-      ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
-      : '🧹 Fresh session for this topic.')
-    if (left) await sayRemovingKeyboard(chatId, fresh); else await send(ctx, threadId, fresh)
+  if (FRESH_COMMANDS.has(cmd)) {
+    await startFresh(ctx, key, threadId)
+    // `/new <request>`: what follows the command is the fresh session's first message.
+    const rest = typed.slice(typed.split(/\s+/)[0].length).trim()
+    if (rest) await gather(ctx, key, threadId, { msg, text: rest })
     return
   }
   if (cmd === '/resume') {
@@ -7408,13 +7505,35 @@ bot.on('message', async ctx => {
   await gather(ctx, key, threadId, { msg, text })
 })
 
+// /new, /reset and /clear: a fresh session for the topic, the old one kept for /resume.
+// Followed by a request, in a message or a file's caption, that request is the fresh
+// session's first message.
+const FRESH_COMMANDS = new Set(['/new', '/reset', '/clear'])
+async function startFresh(ctx: Context, key: string, threadId: number | undefined): Promise<void> {
+  // In a private continuation, a fresh start is a fresh start of your OWN chat: it
+  // leaves the topic first, and the fresh session is in your own directory.
+  const left = ctx.chat!.type === 'private' ? await leavePrivate(key) : undefined
+  // A record even when there is none yet: its stamp is what outranks a live link.
+  const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
+  if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
+  topicSessionChanged(key)
+  const fresh = (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
+    ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
+    : '🧹 Fresh session for this topic.')
+  if (left) await sayRemovingKeyboard(ctx.chat!.id, fresh); else await send(ctx, threadId, fresh)
+}
+// A caption that starts with one of them: the command, and what follows it.
+function freshCaption(caption: string): { rest: string } | undefined {
+  const m = caption.match(/^(\/[a-z]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i)
+  return m && FRESH_COMMANDS.has(m[1].toLowerCase()) ? { rest: (m[2] ?? '').trim() } : undefined
+}
+
 // One file, on its own: saved, and its caption (if any) run as the prompt.
-function takeAttachment(ctx: Context, key: string, threadId: number | undefined, msg: any, attachment: Attachment): void {
-  const caption = msg.caption?.trim()
+function takeAttachment(ctx: Context, key: string, threadId: number | undefined, msg: any, attachment: Attachment, caption: string): void {
   enqueue(key, async () => {
     const cwd = resolveCwd(ctx, threadId)
     let saved: string
-    try { saved = await receiveFile(ctx, attachment, cwd, key) }
+    try { saved = await receiveFile(ctx, attachment, cwd, key, threadId) }
     catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
     const forwarded = caption ? forwardedOf(ctx, msg, caption) : undefined
     if (caption) {
@@ -7543,7 +7662,7 @@ async function runBurst(b: Burst): Promise<void> {
   if (!parts.length) return
   if (parts.length === 1) {
     const [p] = parts
-    if (p.att) return takeAttachment(ctx, key, threadId, p.msg, p.att)
+    if (p.att) return takeAttachment(ctx, key, threadId, p.msg, p.att, p.text)
     const forwarded = forwardedOf(ctx, p.msg, p.text)
     return startTurn(ctx, key, threadId, p.msg, forwarded ? '' : p.text, { forwarded })
   }
@@ -7563,7 +7682,7 @@ async function runBurst(b: Burst): Promise<void> {
     const rels: string[] = []
     for (const p of files) {
       try {
-        const abs = await receiveFile(ctx, p.att!, cwd, key)
+        const abs = await receiveFile(ctx, p.att!, cwd, key, threadId)
         const rel = `./${relative(cwd, abs)}`
         ;(pendingFiles[key] ??= []).push({ abs, rel })
         rels.push(rel)
@@ -7597,8 +7716,10 @@ bot.on('edited_message', ctx => {
 // point where it's actually possible, so retry there rather than making the user
 // restart the bridge to pick it up.
 bot.on('my_chat_member', async ctx => {
-  const status = ctx.myChatMember.new_chat_member.status
-  if (status !== 'administrator') return
+  const member = ctx.myChatMember.new_chat_member
+  if (member.status !== 'administrator') return
+  // Likewise the 🗂 Tasks topic a first task could not make.
+  if (member.can_manage_topics) retryActivityTopic(String(ctx.chat.id))
   await ensureGroupLogo(ctx.chat.id)
 })
 
@@ -7750,7 +7871,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true, forwarded: rec.forwarded }))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true, conv: rec.conv, forwarded: rec.forwarded, asker: rec.asker }))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }
@@ -7980,7 +8101,7 @@ const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boole
   { command: 'config', description: "This group's settings (only you see the menu)", is_ephemeral: true },
   { command: 'private', description: 'Carry this topic on in your DM, where only you see it', is_ephemeral: true },
   { command: 'recall', description: "What each search engine finds in this group's history", is_ephemeral: true },
-  { command: 'new', description: 'Fresh session in this topic (/resume undoes it)' },
+  { command: 'new', description: 'Fresh session in this topic; /new <request> starts it with that (/resume undoes it)' },
   { command: 'stop', description: 'Cancel the running task' },
   { command: 'interrupt', description: 'Stop the running task but keep what it produced' },
   { command: 'bg', description: 'Run a task alongside this topic' },
@@ -8642,11 +8763,14 @@ const OTHER_BOTS = (process.env.TG_OTHER_BOTS || '').split(',').map(s => s.trim(
 const isOtherBot = (u: { id: number; username?: string } | undefined) => !!u?.username && OTHER_BOTS.includes(u.username.toLowerCase())
 const SERVED_DIR = join(TASKS_STATE, 'served')
 const SERVE_MS = 24 * 3600_000
-const PEER_FILE_MAX = 50 * 1024 * 1024
-// What a bot on Telegram's cloud Bot API can download (getFile): bigger goes as a link.
-const PEER_TG_MAX = 20 * 1024 * 1024
+// With TG_API_ID/TG_API_HASH a file goes through Telegram whatever its size, up to
+// 2 GB: sent over MTProto past 50 MB, and fetched that way past 20 MB by the other
+// bot, which is taken to be set up the same. Without them, what a bot on the cloud
+// Bot API can download (getFile, 20 MB) goes through Telegram and bigger as a link.
+const PEER_FILE_MAX = BIG_FILES ? MTPROTO_MAX : 50 * 1024 * 1024
+const PEER_TG_MAX = BIG_FILES ? MTPROTO_MAX : 20 * 1024 * 1024
 // Documents a peer sent ahead of its hand-off message, by chat, peer and tag.
-const peerFiles = new Map<string, { fileId: string; name: string; size: number; at: number }[]>()
+const peerFiles = new Map<string, (Attachment & { at: number })[]>()
 // A Telegram message is at most 4096 characters; a longer brief goes as a file too.
 const PEER_TEXT_MAX = 4000
 
@@ -8686,7 +8810,7 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
     const p = isAbsolute(f) ? f : join(cwdFrom, f)
     if (!existsSync(p) || !statSync(p).isFile()) return { error: `no file ${f}` }
     const size = statSync(p).size
-    if (size > PEER_FILE_MAX) return { error: `${f} is over 50 MB` }
+    if (size > PEER_FILE_MAX) return { error: `${f} is over ${fmtBytes(PEER_FILE_MAX)}` }
     if (size > PEER_TG_MAX && !hookServer) return { error: `${f} is ${fmtBytes(size)}, more than a bot can fetch from Telegram (20 MB); a file that big goes as a link this bot serves, which needs its webhook server: TG_TASKS_WEBHOOK_PORT, and TG_TASKS_PUBLIC_URL when the bots are on different machines` }
     paths.push(p)
   }
@@ -8709,12 +8833,15 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
     deadline: new Date(taskNow().getTime() + LIMITS.peerAnswerMs).toISOString() })
   h = store.updateHandoff(h.id, { peerTag: h.id })!
   // The files first, each captioned with the tag, so they are there when the message is.
-  const docs: { file: InputFile; name: string }[] = [
-    ...paths.filter(p => !viaLink.includes(p)).map(p => ({ file: new InputFile(p, basename(p)), name: basename(p) })),
+  const docs: { file: InputFile; name: string; path?: string }[] = [
+    ...paths.filter(p => !viaLink.includes(p)).map(p => ({ file: new InputFile(p, basename(p)), name: basename(p), path: p })),
     ...(long ? [{ file: new InputFile(Buffer.from(a.brief), 'brief.md'), name: 'brief.md' }] : []),
   ]
   for (const d of docs) {
-    const sent = await bot.api.sendDocument(chatId, d.file, { ...destOpts({ threadId: a.toThread }), caption: `📎 #handoff-${h.id}`, disable_notification: true })
+    const caption = `📎 #handoff-${h.id}`
+    const sent = await (d.path && BIG_FILES && statSync(d.path).size > TG_UPLOAD_LIMIT
+      ? BIG_FILES.upload(chatId, d.path, { threadId: a.toThread, caption, silent: true })
+      : bot.api.sendDocument(chatId, d.file, { ...destOpts({ threadId: a.toThread }), caption, disable_notification: true }))
       .then(() => true, e => { console.error(`[handoff] ${d.name} to @${a.peer}: ${e}`); return false })
     if (!sent) { store.updateHandoff(h.id, { state: 'failed', error: `Telegram didn't take ${d.name}`, endedAt: new Date().toISOString() }); return { error: `Telegram didn't take ${d.name}` } }
   }
@@ -8913,13 +9040,15 @@ async function handlePeerMessage(ctx: Context): Promise<void> {
     // handled side by side, so one may still be on its way: a few seconds for it.
     const want = basename(l.slice('📎 '.length).trim())
     if (!want) continue
-    let got: { fileId: string; name: string; size: number } | undefined
+    let got: Attachment | undefined
     for (const end = Date.now() + 15_000; !(got = peerFiles.get(sentAhead)?.find(f => f.name === want)) && Date.now() < end;) await Bun.sleep(250)
     if (!got) { missed.push(want); continue }
     peerFiles.set(sentAhead, (peerFiles.get(sentAhead) ?? []).filter(f => f !== got))
     try {
-      if (got.size > TG_DOWNLOAD_LIMIT) throw new Error(`it is ${fmtBytes(got.size)}, more than this bot can fetch`)
-      const dest = await fetchTelegramFile(bot.api, got.fileId, ext => uniquePath(ensureDir(inbox), safeName(want, ext)))
+      let dest: string
+      if (got.size <= TG_DOWNLOAD_LIMIT) dest = await fetchTelegramFile(bot.api, got.fileId, ext => uniquePath(ensureDir(inbox), safeName(want, ext)))
+      else if (BIG_FILES && got.chat && got.msgId) await BIG_FILES.download(got.chat, got.msgId, dest = uniquePath(ensureDir(inbox), safeName(want, extname(want))))
+      else throw new Error(`it is ${fmtBytes(got.size)}, more than this bot can fetch without TG_API_ID/TG_API_HASH`)
       landed.push(basename(dest))
     } catch (e) { console.error(`[handoff] from @${peer}: fetching ${want}: ${e}`); missed.push(want) }
   }
@@ -9506,6 +9635,18 @@ function activityThread(t: Task): Promise<number | undefined> {
   return p
 }
 
+// A refusal is remembered ('none') so the group is told once, not with every task.
+// It is forgotten when the bot is given the right to manage topics, or /config sets
+// the activity topic again; the topic is then made at once if the group has tasks,
+// otherwise with its next one.
+function retryActivityTopic(chat: string): void {
+  if (!taskStore || taskStore.getMeta(`activity:${chat}`) !== 'none') return
+  taskStore.setMeta(`activity:${chat}`, undefined)
+  console.log(`[tasks] retrying the activity topic in ${chat}`)
+  const t = taskStore.listTasks({ chat, states: ['active', 'paused'] })[0]
+  if (t) void activityThread(t).catch(e => console.error(`[tasks] activity: ${e}`))
+}
+
 const CHANGE_TEXT: Record<string, (t: Task) => string> = {
   created: t => t.parent ? `👶 "${t.name}" made by the task "${t.parentName ?? t.parent}": ${scheduleText(t.trigger, t.tz)}` : `⏰ "${t.name}" created by ${t.ownerName || 'someone'}: ${scheduleText(t.trigger, t.tz)}`,
   updated: t => `✏️ "${t.name}" changed: ${scheduleText(t.trigger, t.tz)}`,
@@ -9920,6 +10061,7 @@ async function main() {
   console.log(`     default cwd    : ${DEFAULT_WORKDIR}`)
   console.log(`     permission     : ${PERMISSION_MODE}`)
   console.log(`     api            : ${API_ROOT || 'https://api.telegram.org (cloud)'}`)
+  console.log(`     big files      : ${LOCAL_API ? 'local server' : BIG_FILES ? 'over MTProto, up to 2 GB' : '20 MB cap (set TG_API_ID/TG_API_HASH to lift it)'}`)
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)
