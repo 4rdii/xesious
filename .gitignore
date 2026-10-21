@@ -37,3 +37,7 @@ __pycache__/
 .venv/
 # isolated pip --target dir (alt to venv)
 test/staging/.deps/
+
+# Backups update.sh leaves behind. These hold a live bot token and must never be
+# committed — they were, on 2026-10-21, by a `git add -A` during a merge.
+.env.bak-*
