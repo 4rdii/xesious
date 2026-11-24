@@ -509,6 +509,12 @@ function linkForKey(key: string): { uuid: string; link: LiveLink } | null {
 }
 
 const VOICE_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_VOICE || '')
+// Listening and speaking are separate wants: dictating a question is fast, having
+// a table read aloud is not. TG_VOICE_SPEAK=0 keeps the ear (hear/'hear' setting)
+// and drops the mouth — the default spoken-answer mode becomes 'off', while
+// TG_VOICE still enables voice-note transcription. A topic can still opt back in
+// to spoken answers with /voice.
+const VOICE_SPEAK = !/^(0|false|no|off)$/i.test(process.env.TG_VOICE_SPEAK || '')
 const STT_CMD = process.env.TG_STT_CMD || `python3 ${join(HERE, 'voice', 'stt.py')}`
 const TTS_CMD = process.env.TG_TTS_CMD || join(HERE, 'voice', 'tts.sh')
 // A short answer is spoken verbatim; a long one is first summarized to a couple
@@ -764,7 +770,7 @@ function serverDefault(id: string): SettingValue {
   switch (id) {
     case 'model': return MODEL
     case 'effort': return EFFORT_TIER
-    case 'voice': return VOICE_DEFAULT ? 'full' : 'off'
+    case 'voice': return (VOICE_DEFAULT && VOICE_SPEAK) ? 'full' : 'off'
     // On wherever Soniox can hear (SONIOX_API_KEY), else only with TG_VOICE, as when
     // voice mode did both. TG_VOICE_NOTES=on|off decides it outright.
     case 'hear': { const v = process.env.TG_VOICE_NOTES; return v ? /^(1|true|yes|on)$/i.test(v) : !!sonioxStt() || VOICE_DEFAULT }

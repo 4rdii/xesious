@@ -26,9 +26,25 @@ def main() -> int:
     model_name = os.environ.get("TG_STT_MODEL", "base").strip() or "base"
     lang = (os.environ.get("TG_STT_LANG") or "").strip() or None  # None = autodetect
 
-    # int8 on CPU: fast and light; faster-whisper decodes the .ogg itself via PyAV.
+    # int8 on CPU: fast and light.
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(audio, language=lang, vad_filter=True)
+    # Decode with ffmpeg rather than letting faster-whisper do it. Its audio.py
+    # calls av.open(..., metadata_errors=...), which PyAV dropped by v19 (some
+    # boxes have 19.x), and no PyAV below 15 has a wheel for this Python: it
+    # wants Cython and ffmpeg headers to build. ffmpeg is already a hard
+    # dependency of the voice path, so decoding here removes PyAV entirely
+    # instead of pinning around it.
+    import subprocess
+    import numpy as np
+    _ff = os.environ.get("TG_FFMPEG") or "ffmpeg"
+    _r = subprocess.run([_ff, "-nostdin", "-threads", "1", "-i", audio,
+                         "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+                        capture_output=True)
+    if _r.returncode != 0:
+        print(f"stt: ffmpeg could not decode {audio}", file=sys.stderr)
+        return 3
+    pcm = np.frombuffer(_r.stdout, dtype=np.float32)
+    segments, _info = model.transcribe(pcm, language=lang, vad_filter=True)
     text = "".join(seg.text for seg in segments).strip()
     sys.stdout.write(text)
     return 0
