@@ -30,6 +30,7 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
+  ownsTopic as libOwnsTopic,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, runTitle, conflictAdvice, isNonAnswer, lastAnswerBlock, promoteBlock, stalenessNote,
@@ -208,6 +209,74 @@ const ALLOWED_USERS = parseIdList(process.env.TG_ALLOWED_USERS)
 // users. Off by default — it widens authorization to whoever is in that group.
 let TRUST_CHAT_MEMBERS = /^(1|true|yes)$/i.test(process.env.TG_TRUST_CHAT_MEMBERS || '')
 const ALLOWED_CHATS = parseIdList(process.env.TG_ALLOWED_CHATS)
+
+// ── multi-server: one bridge per machine, all in one forum ─────────────────
+// Telegram allows exactly one getUpdates poller per bot token (the guards in
+// main() exist because of it), so several machines cannot share one bot. They
+// can share one SUPERGROUP. Set TG_SERVER_NAME on each machine and every bridge
+// answers only in the topics it owns, ignoring the rest in silence — otherwise
+// one message would draw a reply from every machine in the group.
+//
+// Unset (the default) is single-server behaviour: ownsTopic() is always true and
+// nothing here applies.
+const SERVER_NAME = (process.env.TG_SERVER_NAME || '').trim()
+const MULTI_SERVER = SERVER_NAME !== ''
+// Topics this bridge owns no matter what it has learned. Rarely needed: ownership
+// is normally learned from /claim and from the topics the bridge itself creates.
+const PINNED_TOPICS = parseIdList(process.env.TG_ALLOWED_TOPICS)
+// Learned ownership, keyed like sessions. Persisted.
+let owned: Record<string, true> = {}
+// This bridge's home topic per chat — "General-<server>". Created on first run
+// and used as the place it introduces itself and takes instructions about its
+// other topics. Persisted, because the Bot API cannot list a forum's topics, so
+// a forgotten id means a duplicate topic rather than a re-discovered one.
+let homeTopics: Record<string, number> = {}
+
+function homeTopicName(): string { return `General-${SERVER_NAME}` }
+
+// Does this bridge answer in this topic? The forum's own built-in General
+// (threadId undefined) is deliberately excluded in multi-server mode: it is
+// shared by every bot in the group, so nobody claims it.
+function ownsTopic(chatId: number | string, threadId: number | undefined): boolean {
+  return libOwnsTopic({ multiServer: MULTI_SERVER, chatId, threadId,
+    homeThreadId: homeTopics[String(chatId)], pinned: PINNED_TOPICS, owned })
+}
+
+function claimTopic(chatId: number | string, threadId: number | undefined): void {
+  if (!MULTI_SERVER || threadId === undefined) return
+  owned[keyFor(chatId, threadId)] = true
+  saveState()
+}
+
+function releaseTopic(chatId: number | string, threadId: number | undefined): void {
+  if (threadId === undefined) return
+  delete owned[keyFor(chatId, threadId)]
+  saveState()
+}
+
+// Create this bridge's home topic once per chat, and say hello in it so the
+// topic is not an empty room. Failure is not fatal: the bot may lack
+// can_manage_topics, in which case the operator makes the topic by hand and
+// runs /claim in it.
+async function ensureHomeTopic(chatId: string): Promise<void> {
+  if (!MULTI_SERVER || homeTopics[chatId] !== undefined) return
+  try {
+    const t = await bot.api.createForumTopic(Number(chatId), homeTopicName(),
+      TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+    homeTopics[chatId] = t.message_thread_id
+    names[keyFor(chatId, t.message_thread_id)] = homeTopicName()
+    saveState()
+    await bot.api.sendMessage(Number(chatId),
+      `${homeTopicName()} is up. This topic is ${SERVER_NAME}'s home: talk to that machine here.\n\n` +
+      `Other topics are claimed one at a time — run /claim ${SERVER_NAME} inside a topic and this machine takes it over, ` +
+      `/release to hand it back. The name is required: a bare /claim would be taken by every machine in this group at once. ` +
+      `Topics created from here (/fork) are claimed automatically.`,
+      { message_thread_id: t.message_thread_id })
+  } catch (e) {
+    console.error(`[warn] could not create ${homeTopicName()} in ${chatId}: ${e}`)
+    console.error(`[warn] make the topic by hand and run /claim in it, or grant the bot can_manage_topics`)
+  }
+}
 
 // File transfer between Telegram and a topic's directory (relative to its cwd).
 const INBOX_DIR = 'inbox'    // files the user uploads land here
@@ -783,6 +852,8 @@ function loadState(): void {
       seenUsers = o.seenUsers ?? {}
       contextMarks = o.contextMarks ?? {}
       privateLinks = o.privateLinks ?? {}
+      owned = o.owned ?? {}
+      homeTopics = o.homeTopics ?? {}
       // "Reply only when mentioned" became Topic mode: on → Conversation, off → Bot chat.
       for (const g of Object.values(groupSettings)) if ('mentionOnly' in g) { g.topicMode ??= g.mentionOnly ? 'conversation' : 'bot'; delete g.mentionOnly }
       const legacy = topicSettings.mentionOnly
@@ -808,6 +879,7 @@ function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
     writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers, ttsEngines, voiceParts,
+      owned, homeTopics,
       groupSettings, groupSettingMeta, topicSettings, editorPolicies, seenUsers, contextMarks, privateLinks,
       // Only the ones still awaiting a decision. A fan-out that has started cannot be
       // resumed — its parts were child processes and died with the bridge — so
@@ -5557,6 +5629,7 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
     const t = await ctx.api.createForumTopic(f.chatId, fanoutTopicName(child.title),
       { icon_custom_emoji_id: FANOUT_TOPIC_ICON })
     topicId = t.message_thread_id
+    claimTopic(f.chatId, t.message_thread_id)  // a topic this machine made is one it answers in
   } catch (e) {
     console.error(`[fanout ${f.id}] could not create a topic for part ${child.n}: ${e}`)
   }
@@ -7039,6 +7112,20 @@ bot.on('message', async ctx => {
     names[keyFor(chatId, threadId)] = viaReply; saveState()
   }
 
+  // Multi-server: stay out of topics another machine owns. Silently — a refusal
+  // here would mean N-1 "not mine" replies to every message in the group, which
+  // is exactly the noise the ownership model exists to prevent. /claim is the
+  // one command allowed through in a topic nobody owns, since it is how an
+  // unowned topic gets an owner at all. In multi-server mode it must NAME the
+  // machine: a bare /claim passed this gate on every bridge in the group, so all
+  // of them claimed the same topic and answered together — the exact collision
+  // the ownership model exists to prevent.
+  const words = (msg.text || '').trim().split(/\s+/)
+  const isClaimCmd = words[0]?.split('@')[0] === '/claim'
+  const claimsUs = isClaimCmd && (!MULTI_SERVER ||
+    (words[1] || '').toLowerCase() === SERVER_NAME.toLowerCase())
+  if (ctx.chat.type !== 'private' && !ownsTopic(chatId, threadId) && !claimsUs) return
+
   // Topic mode, for every kind of message — text, voice notes and files alike (the
   // mention check used to sit after the file and voice paths, so those skipped it).
   // Commands always get through, and so does a reply to one of /config's questions.
@@ -7165,6 +7252,31 @@ bot.on('message', async ctx => {
   if (cmd === '/whoami' || cmd === '/id') {
     await answer(
       `your user id: ${ctx.from.id}\nchat id: ${chatId} (${ctx.chat.type})\ntopic id: ${threadId ?? '(none / general)'}`)
+    return
+  }
+  if (cmd === '/claim' || cmd === '/release') {
+    if (!MULTI_SERVER) { await send(ctx, threadId, 'Not running in multi-server mode — set TG_SERVER_NAME to use /claim.'); return }
+    if (ctx.chat.type === 'private') { await send(ctx, threadId, 'Topics are a supergroup thing; there is nothing to claim in a DM.'); return }
+    if (threadId === undefined) { await send(ctx, threadId, "The forum's own General is shared by every machine in this group, so no bot claims it. Use a topic."); return }
+    if (homeTopics[String(chatId)] === threadId) { await send(ctx, threadId, `This is ${SERVER_NAME}'s home topic — it cannot be released.`); return }
+    if (cmd === '/claim') {
+      // Same rule as the gate above, repeated here because a topic this bridge
+      // ALREADY owns reaches the command without passing that check.
+      const target = (text.trim().split(/\s+/)[1] || '')
+      if (MULTI_SERVER && target.toLowerCase() !== SERVER_NAME.toLowerCase()) {
+        if (ownsTopic(chatId, threadId)) {
+          await send(ctx, threadId, target
+            ? `This topic belongs to ${SERVER_NAME}. To move it, /release here first, then /claim ${target} from the other machine.`
+            : `Name the machine: /claim ${SERVER_NAME}. A bare /claim would be taken by every bridge in this group at once.`)
+        }
+        return
+      }
+      claimTopic(chatId, threadId)
+      await send(ctx, threadId, `📌 Claimed by ${SERVER_NAME}. Messages here run on that machine.`)
+    } else {
+      releaseTopic(chatId, threadId)
+      await send(ctx, threadId, `↩️ Released by ${SERVER_NAME}. Nothing answers here until another machine claims it.`)
+    }
     return
   }
   if (cmd === '/help') {
@@ -7873,6 +7985,7 @@ bot.on('message', async ctx => {
     try {
       const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
       tid = topic.message_thread_id
+      claimTopic(chatId, tid)  // a topic this machine made is one it answers in
     } catch (err) { await send(ctx, threadId, `Could not create the topic: ${err}`); return }
     const tkey = keyFor(chatId, tid)
     // The same directory, deliberately: the conversation being forked is ABOUT the
@@ -7940,6 +8053,7 @@ bot.on('message', async ctx => {
         const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
         const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
         const tid = topic.message_thread_id
+        claimTopic(chatId, tid)  // a topic this machine made is one it answers in
         const tkey = keyFor(chatId, tid)
         sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
         names[tkey] = name
@@ -9225,6 +9339,7 @@ function makeLiveThread(chat: string): Promise<number | undefined> {
     try {
       const topic = await bot.api.createForumTopic(Number(chat), LIVE_TOPIC_NAME, { icon_custom_emoji_id: LIVE_TOPIC_ICON })
       const th = topic.message_thread_id, key = keyFor(Number(chat), th)
+      claimTopic(Number(chat), th)  // a topic this machine made is one it answers in
       taskStore!.setMeta(`live:${chat}`, String(th))
       liveCheckedAt.set(chat, Date.now())
       names[key] = LIVE_TOPIC_NAME
@@ -10524,6 +10639,7 @@ const taskBridge: BridgeHandlers = {
     }
     topicsMade.get(s.chat)!.push(Date.now())
     const key = keyFor(Number(s.chat), tid)
+    claimTopic(Number(s.chat), tid)  // a topic this machine made is one it answers in
     names[key] = name
     sessions[key] = { cwd: body?.cwd ? String(body.cwd) : ensureDir(uniqueTopicDir(sanitize(name), key, tid)) }
     // Settings carried over as /fork carries them.
@@ -11172,6 +11288,7 @@ function activityThread(t: Task): Promise<number | undefined> {
     try {
       const topic = await bot.api.createForumTopic(Number(t.chat), '🗂 Tasks', TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
       const th = topic.message_thread_id
+      claimTopic(Number(t.chat), th)  // a topic this machine made is one it answers in
       taskStore!.setMeta(`activity:${t.chat}`, String(th))
       names[keyFor(Number(t.chat), th)] = '🗂 Tasks'
       saveState()
@@ -11615,6 +11732,9 @@ async function main() {
   await contextStart()
   await ensureBotLogo(me.id)
   await ensureGroupLogos()
+  // Multi-server: make this machine's "General-<server>" home topic in each chat
+  // (once; skipped when already known from state). No-op unless TG_SERVER_NAME is set.
+  for (const id of ALLOWED_CHATS) await ensureHomeTopic(id)
   console.log(`[ok] @${me.username} up`)
   console.log(`     claude bin     : ${CLAUDE_BIN}`)
   console.log(`     sessions base  : ${SESSIONS_BASE}`)
@@ -11626,6 +11746,11 @@ async function main() {
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)
+  console.log(`     server name    : ${MULTI_SERVER ? SERVER_NAME : '(single-server: answers every topic)'}`)
+  if (MULTI_SERVER) {
+    console.log(`     home topics    : ${Object.entries(homeTopics).map(([c, t]) => `${c}#${t}`).join(', ') || '(none yet)'}`)
+    console.log(`     owned topics   : ${Object.keys(owned).length + PINNED_TOPICS.size} (claim more with /claim inside a topic)`)
+  }
   // Checked once at boot, beside permission and api, so a deployment with TG_VOICE=1
   // learns its engine is missing here rather than after the first message.
   if (VOICE_DEFAULT) {
