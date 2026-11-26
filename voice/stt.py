@@ -24,7 +24,11 @@ def main() -> int:
         return 3
 
     model_name = os.environ.get("TG_STT_MODEL", "base").strip() or "base"
-    lang = (os.environ.get("TG_STT_LANG") or "").strip() or None  # None = autodetect
+    lang = (os.environ.get("TG_STT_LANG") or "").strip() or None  # fixed language, or None
+    # Constrain language DETECTION to the languages this user actually speaks.
+    # Whisper otherwise auto-detects across all 99 languages and misfires on short
+    # or accented notes ("random languages"); TG_STT_LANGS=en,fa keeps it to those.
+    allow = [x.strip() for x in (os.environ.get("TG_STT_LANGS") or "").split(",") if x.strip()]
 
     # int8 on CPU: fast and light.
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
@@ -44,6 +48,17 @@ def main() -> int:
         print(f"stt: ffmpeg could not decode {audio}", file=sys.stderr)
         return 3
     pcm = np.frombuffer(_r.stdout, dtype=np.float32)
+    # If no language is fixed but an allowlist is given, detect among ONLY those.
+    if lang is None and allow:
+        try:
+            _lang, _prob, all_probs = model.detect_language(pcm, vad_filter=True)
+            cand = [(l, p) for (l, p) in all_probs if l in allow]
+            if cand:
+                lang = max(cand, key=lambda x: x[1])[0]
+        except Exception as e:
+            print(f"stt: language detect fell back to {allow[0]} ({e})", file=sys.stderr)
+        if lang is None:
+            lang = allow[0]
     segments, _info = model.transcribe(pcm, language=lang, vad_filter=True)
     text = "".join(seg.text for seg in segments).strip()
     sys.stdout.write(text)
